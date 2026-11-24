@@ -1,0 +1,138 @@
+# Upstream golang.org/x/net has no GitHub Actions CI (it is tested on the Go
+# project's own TryBot/LUCI infrastructure), so this workflow is written from
+# scratch. It packages the module zip exactly as the module proxy does and runs
+# the project's own test suite (`go test ./...`).
+name: seal-build
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: 'Go package pattern(s) to test (empty = ./...)'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  module-zip:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          cache: false
+
+      # Build the packaging helper in its own module OUTSIDE the checkout, so
+      # `go get` never touches this repository's go.mod/go.sum.
+      - name: Build module-zip helper
+        run: |
+          set -eux
+          HELPER=$(mktemp -d)
+          cp "$GITHUB_WORKSPACE/.github/create_mod.go" "$HELPER/"
+          cd "$HELPER"
+          go mod init example.com/mod
+          go get golang.org/x/mod@v0.28.0
+          go build -o "$RUNNER_TEMP/create_mod" .
+
+      # golang.org/x/mod/zip skips .git but DESCENDS into .github, so this
+      # workflow would otherwise leak into the zip as extra entries that the
+      # public proxy artifact does not have. .gitignore and .gitattributes are
+      # kept: they ARE part of the published module zip.
+      - name: Create module zip
+        run: |
+          set -eux
+          mkdir -p "$RUNNER_TEMP/out"
+          rm -rf "$GITHUB_WORKSPACE/.github"
+          "$RUNNER_TEMP/create_mod" \
+            golang.org/x/net v0.45.0 \
+            "$GITHUB_WORKSPACE" \
+            "$RUNNER_TEMP/out/v0.45.0.zip"
+          unzip -l "$RUNNER_TEMP/out/v0.45.0.zip" | tail -5
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: module-zip
+          path: ${{ runner.temp }}/out/v0.45.0.zip
+          if-no-files-found: error
+
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+
+      - name: Build
+        run: |
+          set -eux
+          go version
+          go build ./...
+
+      # `go test -json` tags every output line with its test, so the report
+      # below can print each skipped test together with its t.Skip reason
+      # (under plain -v, parallel tests interleave and the reason is printed
+      # away from the --- SKIP line). The job exits with go test's own status.
+      - name: Test
+        run: |
+          set +e -u
+          go test -json ${{ inputs.test-filter || './...' }} > "$RUNNER_TEMP/test.json"
+          rc=$?
+          python3 - "$RUNNER_TEMP/test.json" <<'EOF'
+          import json, sys
+          from collections import defaultdict
+          out = defaultdict(list)
+          res = {}
+          pkgres = {}
+          for line in open(sys.argv[1], encoding="utf-8", errors="replace"):
+              line = line.strip()
+              if not line.startswith("{"):
+                  print(line)
+                  continue
+              ev = json.loads(line)
+              key = (ev.get("Package", ""), ev.get("Test"))
+              act = ev.get("Action")
+              if act == "output":
+                  out[key].append(ev.get("Output", ""))
+              elif act in ("pass", "fail", "skip"):
+                  if ev.get("Test"):
+                      res[key] = act
+                  else:
+                      pkgres[ev.get("Package", "")] = act
+          # Per-test result lines, package by package.
+          for pkg in sorted(pkgres):
+              for (p, t), a in sorted(res.items(), key=lambda kv: kv[0][1] or ""):
+                  if p == pkg:
+                      print(f"{a.upper():4} {pkg} {t}")
+              print(f"== package {pkg}: {pkgres[pkg].upper()}")
+          print("=== Skipped tests (name and reason) ===")
+          for (p, t), a in sorted(res.items(), key=lambda kv: (kv[0][0], kv[0][1] or "")):
+              if a == "skip":
+                  reason = " ".join(l.strip() for l in out[(p, t)]
+                                    if not l.startswith(("=== ", "--- ")) and l.strip())
+                  print(f"SKIP {p} {t}: {reason or '(no message)'}")
+          print("=== Failed tests (with output) ===")
+          for (p, t), a in sorted(res.items(), key=lambda kv: (kv[0][0], kv[0][1] or "")):
+              if a == "fail":
+                  print(f"FAIL {p} {t}")
+                  sys.stdout.write("".join(out[(p, t)]))
+          for pkg, a in sorted(pkgres.items()):
+              if a == "fail":
+                  sys.stdout.write("".join(out[(pkg, None)]))
+          n = lambda k: sum(1 for a in res.values() if a == k)
+          print("=== Test summary ===")
+          print(f"Packages: {len(pkgres)} ({sum(1 for a in pkgres.values() if a == 'pass')} ok, "
+                f"{sum(1 for a in pkgres.values() if a == 'fail')} failed)")
+          print(f"Tests passed: {n('pass')}")
+          print(f"Tests failed: {n('fail')}")
+          print(f"Tests skipped: {n('skip')}")
+          EOF
+          echo "go test exit status: $rc"
+          exit $rc
